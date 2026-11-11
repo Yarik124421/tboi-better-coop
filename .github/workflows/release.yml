@@ -1,0 +1,35 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    if: ${{ !github.event.deleted }}
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build winmm.dll
+        shell: pwsh
+        run: .\Build.cmd
+
+      - name: Package the mod
+        shell: pwsh
+        run: Compress-Archive -LiteralPath 'build/winmm.dll', 'README.md' -DestinationPath 'build/TBOI-Better-Coop-win32.zip'
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" 'build/TBOI-Better-Coop-win32.zip' `
+            --verify-tag --title "TBOI Better Coop $env:GITHUB_REF_NAME" --generate-notes
