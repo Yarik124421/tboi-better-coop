@@ -89,7 +89,14 @@ bool MatchesGameImage(const wchar_t* path) {
     return hashed && std::memcmp(digest, expected, sizeof(expected)) == 0;
 }
 
-void DiscardOnlineEvent(uint64_t, const char*, const char*, unsigned, int, int) {}
+using GameLog = void (__cdecl *)(int, const char*, ...);
+constexpr uintptr_t GameLogRva = 0x6112C0;
+
+// Mirror mod events into the game's own log.txt (and its desync dumps).
+void GameLogEvent(uint64_t peer, const char* event, const char* reason, unsigned frame, int from, int to) {
+    const auto log = reinterpret_cast<GameLog>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + GameLogRva);
+    log(1, "[BetterCoop] [Frame %u] %s: %s (from=%d to=%d peer=%llu)\n", frame, event, reason, from, to, peer);
+}
 
 BOOL CALLBACK InitializeFeatures(PINIT_ONCE, PVOID, PVOID*) {
     int count = 0;
@@ -118,10 +125,10 @@ BOOL CALLBACK InitializeFeatures(PINIT_ONCE, PVOID, PVOID*) {
         return TRUE;
     }
     if (options.roomRejoin) {
-        EnableRoomRejoin(DiscardOnlineEvent);
+        EnableRoomRejoin(GameLogEvent);
     }
     if (options.saveOnline || options.resumeOnline) {
-        EnableOnlineCheckpoint(DiscardOnlineEvent, options.resumeOnline);
+        EnableOnlineCheckpoint(GameLogEvent, options.resumeOnline);
     }
     return TRUE;
 }
