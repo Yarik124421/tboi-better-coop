@@ -5,6 +5,7 @@
 #include <tlhelp32.h>
 #include <cstdio>
 #include <cwchar>
+#include "../version.h"
 
 int wmain(int argc, wchar_t** argv) {
     if (argc != 2) {
@@ -12,7 +13,9 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     wchar_t dll[MAX_PATH];
-    if (!GetFullPathNameW(argv[1], MAX_PATH, dll, nullptr) || GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) {
+    const DWORD length = GetFullPathNameW(argv[1], MAX_PATH, dll, nullptr);
+    const DWORD attributes = length && length < MAX_PATH ? GetFileAttributesW(dll) : INVALID_FILE_ATTRIBUTES;
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
         std::fwprintf(stderr, L"DLL not found: %ls\n", argv[1]);
         return 1;
     }
@@ -20,6 +23,10 @@ int wmain(int argc, wchar_t** argv) {
     DWORD pid = 0;
     int matches = 0;
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        std::fwprintf(stderr, L"Process enumeration failed: %lu\n", GetLastError());
+        return 1;
+    }
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
@@ -44,6 +51,10 @@ int wmain(int argc, wchar_t** argv) {
     void* remote = VirtualAllocEx(process, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remote || !WriteProcessMemory(process, remote, dll, size, nullptr)) {
         std::fwprintf(stderr, L"Writing the DLL path failed: %lu\n", GetLastError());
+        if (remote) {
+            VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+        }
+        CloseHandle(process);
         return 1;
     }
     const auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(
@@ -51,9 +62,18 @@ int wmain(int argc, wchar_t** argv) {
     const HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary, remote, 0, nullptr);
     if (!thread) {
         std::fwprintf(stderr, L"CreateRemoteThread failed: %lu\n", GetLastError());
+        VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+        CloseHandle(process);
         return 1;
     }
-    WaitForSingleObject(thread, 10000);
+    const DWORD wait = WaitForSingleObject(thread, 10000);
+    if (wait != WAIT_OBJECT_0) {
+        std::fwprintf(stderr, L"DLL loading has not completed (wait result %lu). Check log.txt before retrying.\n", wait);
+        // The loader may still be reading the path in the target process.
+        CloseHandle(thread);
+        CloseHandle(process);
+        return 1;
+    }
     DWORD module = 0;
     GetExitCodeThread(thread, &module);
     CloseHandle(thread);
@@ -63,6 +83,7 @@ int wmain(int argc, wchar_t** argv) {
         std::fwprintf(stderr, L"LoadLibraryW failed inside the game\n");
         return 1;
     }
-    std::wprintf(L"Injected into isaac-ng.exe (pid %lu). Look for room_snapshot_v11_hotfix in log.txt.\n", pid);
+    std::wprintf(L"Injected into isaac-ng.exe (pid %lu). Look for %ls in log.txt.\n", pid,
+                 BetterCoop::HotfixMarkerWide);
     return 0;
 }

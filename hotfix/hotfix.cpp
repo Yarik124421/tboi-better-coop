@@ -10,7 +10,6 @@
 using OnlineEvent = void (*)(uint64_t, const char*, const char*, unsigned, int, int);
 void EnableRoomRejoin(OnlineEvent logger);
 void SetRoomRejoinLogger(OnlineEvent logger);
-void ReleaseStuckSoloControls();
 
 namespace {
 
@@ -68,7 +67,6 @@ DWORD WINAPI Install(void*) {
     }
 
     SetRoomRejoinLogger(GameLogEvent);
-    ReleaseStuckSoloControls();
     return 0;
 }
 

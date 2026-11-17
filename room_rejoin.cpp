@@ -2,7 +2,10 @@
 #include <windows.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include "version.h"
 
 namespace {
 
@@ -17,6 +20,10 @@ using RestoreJoinedGame = int (__thiscall *)(void*, void*, int, int);
 using CaptureGameState = int (__thiscall *)(void*, void*);
 using UpdateGame = void (__thiscall *)(void*);
 using JoinEntityPass = int (__cdecl *)();
+using CapturePlayerState = int (__thiscall *)(void*, void*, int);
+using RestorePlayerState = int (__thiscall *)(void*, const void*);
+using UpdateRestoredFamiliar = int (__thiscall *)(void*);
+using PreviewTrinketStats = void (__thiscall *)(void*, char, int);
 using GetMatchmaking = void* (__cdecl *)();
 using GetLobbyOwner = SteamId (__cdecl *)(void*, SteamId);
 using GetLobbyMemberCount = int (__cdecl *)(void*, SteamId);
@@ -45,6 +52,24 @@ constexpr uintptr_t GameUpdateRva = 0x2FADC0;
 constexpr uintptr_t HostJoinPassCallRva = 0x50CCF7;
 constexpr uintptr_t JoinEntityPassRva = 0x50D3F0;
 constexpr uintptr_t GuestJoinPassCallRva = 0x2F5990;
+constexpr uintptr_t FamiliarInitializeRva = 0x20DE70;
+constexpr uintptr_t FamiliarInitializeSlotRva = 0x764920;
+constexpr uintptr_t CaptureLeavingPlayerCallRva = 0x5061CB;
+constexpr uintptr_t CapturePlayerStateRva = 0x3B0BE0;
+constexpr uintptr_t PrepareRoomEntitiesCallRva = 0x430BBF;
+constexpr uintptr_t PrepareRoomEntitiesRva = 0x2FE2F0;
+constexpr uintptr_t IncubusWeaponCallRva = 0x21DE04;
+constexpr uintptr_t TwistedBabyWeaponCallRva = 0x223A78;
+constexpr uintptr_t FamiliarWeaponUpdateRva = 0x22E620;
+constexpr uintptr_t RestoreCachedPlayerCallRva = 0x50C945;
+constexpr uintptr_t RestorePlayerStateRva = 0x3AE4B0;
+constexpr uintptr_t RestoreSavedFamiliarsRva = 0x3B0070;
+constexpr uintptr_t RestoredFamiliarUpdateCallRva = 0x230C5F;
+constexpr uintptr_t PreviewAddedTrinketCallRva = 0x44DEF3;
+constexpr uintptr_t PreviewRemovedTrinketCallRva = 0x44E267;
+constexpr uintptr_t PreviewTrinketStatsRva = 0x44EB10;
+constexpr uintptr_t SeedDeathmatchRoomCallRva = 0x28E11;
+constexpr uintptr_t SeedRoomDescriptorRva = 0x28940;
 // Global MT19937 used for the frame checksum. The join message carries it.
 constexpr uintptr_t GlobalRngStateRva = 0x87AC70;
 constexpr uintptr_t GlobalRngIndexRva = 0x834F04;
@@ -61,6 +86,7 @@ constexpr size_t GameDimension = 99084;
 constexpr size_t GameRoomTransition = 112700;
 constexpr size_t GameStageTransition = 113272;
 constexpr size_t GamePlayers = 113320;
+constexpr size_t SavedFamiliarCount = 892;
 // ItemOverlay (transformation/giantbook style): state 0 idle, 1 delay, 2
 // showing. While showing, Game::Update skips the world update.
 constexpr size_t GameItemOverlay = 0x1C034;
@@ -70,9 +96,17 @@ constexpr size_t EntityType = 40;
 constexpr size_t EntityVariant = 44;
 constexpr size_t EntitySubtype = 48;
 constexpr size_t EntityPosition = 828;
+constexpr size_t EntitySeed = 32;
+constexpr size_t EntityParent = 956;
+constexpr size_t EntityChild = 960;
+constexpr size_t EntityTarget = 964;
+constexpr size_t FamiliarOwner = 1040;
+constexpr size_t FamiliarPathfinder = 1532;
 constexpr uintptr_t GameLogRva = 0x6112C0;
 constexpr unsigned DiagFrames = 8;
 constexpr size_t PlayerControlsEnabled = 1040;
+constexpr size_t PlayerQueuedItem = 6084;
+constexpr size_t PlayerCacheFlags = 5492;
 constexpr size_t EntityFlags = 0x168;
 constexpr size_t EntityActive = 370;
 // FLAG_INTERPOLATION_UPDATE: Player::Update skips its RNG-drawing logic.
@@ -104,7 +138,6 @@ constexpr unsigned ReplayFrames = 16;
 constexpr unsigned ControlDelayFrames = 30;
 constexpr unsigned ControlGateTimeoutFrames = 900;
 constexpr char CapabilityKey[] = "isaac_netdiag_room_rejoin";
-constexpr char CapabilityVersion[] = "11";
 
 struct SharedResources {
     int coins;
@@ -148,6 +181,7 @@ Room sourceRoom{};
 RejoinReplay replay{};
 SteamId advertisedLobby;
 bool writingRoomSnapshot;
+bool loadingRoomSnapshot;
 SharedResources stagedResources;
 const void* markedHostManager;
 const void* markedGuestApp;
@@ -163,6 +197,10 @@ RestoreJoinedGame originalRestoreJoinedGame;
 CaptureGameState originalCaptureGameState;
 UpdateGame originalGameUpdate;
 JoinEntityPass originalJoinEntityPass;
+CapturePlayerState originalCapturePlayerState;
+RestorePlayerState originalRestorePlayerState;
+RestorePlayerState restoreSavedFamiliars;
+PreviewTrinketStats originalPreviewTrinketStats;
 // Global RNG exactly as received in the room snapshot message. Host and guest
 // run different join setup code afterwards, which draws different amounts
 // from it; both put this copy back once that setup is done.
@@ -198,6 +236,134 @@ template <typename T>
 T SteamExport(const char* name) {
     const auto steam = GetModuleHandleW(L"steam_api.dll");
     return steam ? reinterpret_cast<T>(GetProcAddress(steam, name)) : nullptr;
+}
+
+// Restore gameplay hooks left by earlier DLLs when applying this hotfix.
+bool RestoreFamiliarInitialize() {
+    auto* slot = At<uintptr_t*>(FamiliarInitializeSlotRva);
+    const auto replacement = image + FamiliarInitializeRva;
+    if (*slot == replacement) {
+        return true;
+    }
+    {
+        HMODULE previousModule = nullptr;
+        wchar_t path[MAX_PATH];
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(*slot), &previousModule)) {
+            return false;
+        }
+        const DWORD length = GetModuleFileNameW(previousModule, path, _countof(path));
+        const auto* name = length && length < _countof(path) ? std::wcsrchr(path, L'\\') : nullptr;
+        constexpr wchar_t hotfixPrefix[] = L"bettercoop_hotfix_v";
+        if (!name || (_wcsicmp(name + 1, L"winmm.dll") != 0 &&
+                      _wcsnicmp(name + 1, hotfixPrefix, _countof(hotfixPrefix) - 1) != 0)) {
+            return false;
+        }
+    }
+    DWORD protection;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) {
+        return false;
+    }
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(slot), static_cast<LONG>(replacement));
+    DWORD oldProtection;
+    VirtualProtect(slot, sizeof(*slot), protection, &oldProtection);
+    return true;
+}
+
+int __fastcall OnCaptureLeavingPlayer(void* player, void*, void* snapshot, int includeTemporary) {
+    const int result = originalCapturePlayerState(player, snapshot, includeTemporary);
+    const auto app = *At<const uint8_t**>(AppRva);
+    if (logEvent && app && Read<uint8_t>(app, AppOnlineRun)) {
+        logEvent(0, "room_rejoin_saved_familiars", "leaving_player", Read<unsigned>(app, AppNetManager + NetFrame),
+                 Read<int>(player, 5664), Read<int>(snapshot, 892));
+    }
+    return result;
+}
+
+int __fastcall OnRestoreCachedPlayer(void* player, void*, const void* snapshot) {
+    const int result = originalRestorePlayerState(player, snapshot);
+    const unsigned count = Read<unsigned>(snapshot, SavedFamiliarCount);
+    if (logEvent && writingRoomSnapshot && count != 0) {
+        // The returning-player cache loads stats but omits the second half
+        // of native restoration. Restore its saved familiars before the host
+        // captures the common snapshot and destroys this temporary player state.
+        restoreSavedFamiliars(player, snapshot);
+        const auto app = *At<const uint8_t**>(AppRva);
+        logEvent(0, "room_rejoin_saved_familiars", "cached_player_restored",
+                 app ? Read<unsigned>(app, AppNetManager + NetFrame) : 0, Read<int>(player, 5664),
+                 static_cast<int>(count));
+    }
+    return result;
+}
+
+int __fastcall UpdateFamiliarAfterRestore(void* familiar, void*) {
+    if (logEvent && (writingRoomSnapshot || loadingRoomSnapshot)) {
+        // Saved fields have already been applied. Eager Update here runs with
+        // only part of the room restored; local pooled state/room context can
+        // change RNG draws (Dark Bum on frame 88132) and follower positions.
+        // The common post-join entity pass will update the completed room.
+        const auto app = *At<const uint8_t**>(AppRva);
+        logEvent(0, "room_rejoin_familiar_update", writingRoomSnapshot ? "deferred_cached" : "deferred_snapshot",
+                 app ? Read<unsigned>(app, AppNetManager + NetFrame) : 0,
+                 Read<int>(familiar, EntityVariant), Read<int>(familiar, EntitySeed));
+        return 0;
+    }
+    const auto vtable = Read<const void*>(familiar);
+    return Read<UpdateRestoredFamiliar>(vtable, 12)(familiar);
+}
+
+// Replaces MOV ECX, EDI / CALL [EAX+0Ch] in Familiar::RestoreSaveState.
+// EDI is the familiar, and the native virtual method takes no stack arguments.
+__declspec(naked) void OnRestoredFamiliarUpdate() {
+    __asm {
+        mov ecx, edi
+        jmp UpdateFamiliarAfterRestore
+    }
+}
+
+struct PreviewQueueScope {
+    void* player;
+    const void* queuedItem;
+    uint32_t cacheFlags;
+
+    explicit PreviewQueueScope(void* owner)
+        : player(owner), queuedItem(Read<const void*>(owner, PlayerQueuedItem)),
+          cacheFlags(Read<uint32_t>(owner, PlayerCacheFlags)) {
+        Write<const void*>(player, PlayerQueuedItem, nullptr);
+        // The preview requests its own stat flags. Do not let it consume
+        // unrelated pending simulation work (e.g. familiar cache refresh).
+        Write<uint32_t>(player, PlayerCacheFlags, 0);
+    }
+
+    ~PreviewQueueScope() {
+        Write(player, PlayerQueuedItem, queuedItem);
+        Write(player, PlayerCacheFlags, cacheFlags);
+    }
+
+    PreviewQueueScope(const PreviewQueueScope&) = delete;
+    PreviewQueueScope& operator=(const PreviewQueueScope&) = delete;
+};
+
+void __fastcall OnPreviewTrinketStats(void* preview, void*, char adding, int golden) {
+    const auto app = *At<const uint8_t**>(AppRva);
+    const auto player = Read<void*>(preview, 72);
+    const auto queued = player ? Read<const void*>(player, PlayerQueuedItem) : nullptr;
+    if (logEvent && app && Read<unsigned>(app, 8) == 2 && Read<uint8_t>(app, AppOnlineRun) &&
+        queued && Read<int>(queued) == 2) {
+        // Preview's own trinket override supplies the hypothetical item. Do
+        // not count the real pending pickup a second time, or during its
+        // rollback evaluation. Keep the native numeric comparison intact.
+        // Both temporary queue masking and pending cache flags are restored
+        // before returning to the normal pickup/simulation path.
+        {
+            PreviewQueueScope scope(player);
+            originalPreviewTrinketStats(preview, adding, golden);
+        }
+        logEvent(0, "trinket_preview", adding ? "online_add_isolated" : "online_remove_isolated",
+                 Read<unsigned>(app, AppNetManager + NetFrame), Read<int>(preview, 4), Read<int>(queued, 4));
+        return;
+    }
+    originalPreviewTrinketStats(preview, adding, golden);
 }
 
 SteamId CurrentSteamLobby(uintptr_t imageBase) {
@@ -302,7 +468,7 @@ void AdvertiseRoomRejoin() {
     void* matchmaking = getMatchmaking ? getMatchmaking() : nullptr;
     const char* visibility = matchmaking && getData ? getData(matchmaking, lobby, "visibility") : nullptr;
     if (visibility && (std::strcmp(visibility, "0") == 0 || std::strcmp(visibility, "1") == 0) && setData) {
-        setData(matchmaking, lobby, CapabilityKey, CapabilityVersion);
+        setData(matchmaking, lobby, CapabilityKey, BetterCoop::Version);
         advertisedLobby = lobby;
     }
 }
@@ -313,7 +479,7 @@ bool PeerSupportsRoomRejoin(SteamId peer) {
     void* matchmaking = getMatchmaking ? getMatchmaking() : nullptr;
     const char* version = matchmaking && getData
         ? getData(matchmaking, CurrentSteamLobby(image), peer, CapabilityKey) : nullptr;
-    return version && std::strcmp(version, CapabilityVersion) == 0;
+    return version && std::strcmp(version, BetterCoop::Version) == 0;
 }
 
 const uint8_t* SinglePlayer(const void* game) {
@@ -556,6 +722,8 @@ __declspec(naked) void OnReadParity() {
 int __fastcall OnCaptureRoomSnapshot(void* game, void*, void* snapshot) {
     const int result = originalCaptureGameState(game, snapshot);
     if (writingRoomSnapshot && Read<unsigned>(snapshot, SavedPlayerCount) == 2) {
+        const auto app = *At<const uint8_t**>(AppRva);
+        const unsigned frame = app ? Read<unsigned>(app, AppNetManager + NetFrame) : 0;
         // Joining creates a second character with starting counters. Persist
         // the host's pre-join shared pool for both characters.
         for (size_t i = 0; i < 2; ++i) {
@@ -565,6 +733,8 @@ int __fastcall OnCaptureRoomSnapshot(void* game, void*, void* snapshot) {
             Write(snapshot, offset + 40, stagedResources.bombs);
             Write(snapshot, offset + 44, stagedResources.goldenKey);
             Write(snapshot, offset + 45, stagedResources.goldenBomb);
+            logEvent(0, "room_rejoin_saved_familiars", "snapshot", frame, static_cast<int>(i),
+                     Read<int>(snapshot, offset + SavedFamiliarCount));
         }
     }
     return result;
@@ -768,6 +938,67 @@ int __cdecl OnHostJoinPass() {
 
 using GameLog = void (__cdecl *)(int, const char*, ...);
 
+struct StatObservation {
+    const void* player;
+    unsigned seed;
+    int slot;
+    uint32_t speed;
+    uint32_t damage;
+    uint32_t fireDelay;
+    uint32_t shotSpeed;
+    uint32_t range;
+};
+
+const void* statObservationGame;
+StatObservation statObservations[8]{};
+
+// Observe cached values only. Do not evaluate caches or write player stats:
+// trinket pickups diverged before any room rejoin in the 2026-11-17 logs.
+void ObservePlayerStats(const void* game, const char* phase) {
+    const auto app = *At<const uint8_t**>(AppRva);
+    if (!app || !game || game != *At<const void**>(GameRva) ||
+        Read<unsigned>(app, 8) != 2 || !Read<uint8_t>(app, AppOnlineRun)) {
+        statObservationGame = nullptr;
+        return;
+    }
+    if (statObservationGame != game) {
+        std::memset(statObservations, 0, sizeof(statObservations));
+        statObservationGame = game;
+    }
+    const auto players = Read<const uint8_t* const*>(game, GamePlayers);
+    const auto end = Read<const uint8_t* const*>(game, GamePlayers + 4);
+    if (!players || !end || end < players || end - players > 8) {
+        return;
+    }
+    for (auto current = players; current != end; ++current) {
+        const auto player = *current;
+        if (!player || Read<int>(player, EntityType) != 1) {
+            continue;
+        }
+        const StatObservation now{player, Read<unsigned>(player, EntitySeed), Read<int>(player, 5664),
+            Read<uint32_t>(player, 0x1568), Read<uint32_t>(player, 0x1470), Read<uint32_t>(player, 0x1460),
+            Read<uint32_t>(player, 0x1464), Read<uint32_t>(player, 0x1480)};
+        auto& previous = statObservations[current - players];
+        if (previous.player != now.player || previous.seed != now.seed || previous.slot != now.slot ||
+            previous.speed != now.speed || previous.damage != now.damage || previous.fireDelay != now.fireDelay ||
+            previous.shotSpeed != now.shotSpeed || previous.range != now.range) {
+            At<GameLog>(GameLogRva)(1,
+                "[BetterCoop] [Frame %u] stat_change %s: slot=%d seed=%08x speed=%.6f dmg=%.6f "
+                "firedelay=%.6f shotspeed=%.6f range=%.3f room=%d\n",
+                Read<unsigned>(app, AppNetManager + NetFrame), phase, now.slot, now.seed,
+                static_cast<double>(Read<float>(player, 0x1568)), static_cast<double>(Read<float>(player, 0x1470)),
+                static_cast<double>(Read<float>(player, 0x1460)), static_cast<double>(Read<float>(player, 0x1464)),
+                static_cast<double>(Read<float>(player, 0x1480)), Read<int>(game, GameRoomIndex));
+            previous = now;
+        }
+    }
+}
+
+unsigned LinkedEntitySeed(const void* entity, size_t field) {
+    const auto linked = Read<const void*>(entity, field);
+    return linked ? Read<unsigned>(linked, EntitySeed) : 0;
+}
+
 void DumpEntities(const void* game, const char* when, bool force) {
     const auto app = *At<const uint8_t**>(AppRva);
     if (!app) {
@@ -803,6 +1034,18 @@ void DumpEntities(const void* game, const char* when, bool force) {
             static_cast<double>(Read<float>(e, EntityPosition)), static_cast<double>(Read<float>(e, EntityPosition + 4)),
             Read<uint32_t>(e, EntityFlags + 4), Read<uint32_t>(e, EntityFlags),
             Read<int>(e, EntityType) == 1 ? Read<uint8_t>(e, PlayerControlsEnabled) : 0u);
+        if (Read<int>(e, EntityType) == 3) {
+            const auto owner = Read<const void*>(e, FamiliarOwner);
+            const auto path = e + FamiliarPathfinder;
+            log(1, "[BetterCoop] [Frame %u] familiar %s: #%u seed=%08x owner_slot=%d owner_seed=%08x "
+                "parent=%08x child=%08x target=%08x path_grid=%d path_goal=%d path_counter=%d "
+                "path_goal_pos=(%.3f,%.3f) flags3446=%u\n", frame, when, i, Read<unsigned>(e, EntitySeed),
+                owner ? Read<int>(owner, 5664) : -1, owner ? Read<unsigned>(owner, EntitySeed) : 0,
+                LinkedEntitySeed(e, EntityParent), LinkedEntitySeed(e, EntityChild), LinkedEntitySeed(e, EntityTarget),
+                Read<int>(path, 32), Read<int>(path, 20), Read<int>(path, 36),
+                static_cast<double>(Read<float>(path, 1840)), static_cast<double>(Read<float>(path, 1844)),
+                Read<uint8_t>(e, 3446));
+        }
         if (Read<int>(e, EntityType) == 1) {
             // Cached stats (offsets from the Lua EntityPlayer bindings).
             log(1, "[BetterCoop] [Frame %u] diag %s: #%u stats dmg=%.4f firedelay=%.4f shotspeed=%.4f range=%.2f "
@@ -835,20 +1078,27 @@ void DumpEntities(const void* game, const char* when, bool force) {
 void __fastcall OnGameUpdate(void* game, void*) {
     if (logEvent) {
         UpdateControlGate(game);
+        ObservePlayerStats(game, "before_update");
         if (diagActive) {
             DumpEntities(game, "before_update");
         }
     }
     originalGameUpdate(game);
-    if (logEvent && diagActive) {
-        DumpEntities(game, "after_update");
+    if (logEvent) {
+        ObservePlayerStats(game, "after_update");
+        if (diagActive) {
+            DumpEntities(game, "after_update");
+        }
     }
 }
 
 int __fastcall OnRestoreHost(void* manager, void*, void* snapshot, int roster, int flags) {
     const bool roomSnapshot = logEvent && manager == markedHostManager;
     markedHostManager = nullptr;
+    const bool previousLoading = loadingRoomSnapshot;
+    loadingRoomSnapshot = previousLoading || roomSnapshot;
     const int result = originalRestoreJoinedGame(manager, snapshot, roster, flags);
+    loadingRoomSnapshot = previousLoading;
     if (roomSnapshot) {
         const auto game = *At<const void**>(GameRva);
         const auto& room = replay.destination;
@@ -867,7 +1117,10 @@ void __fastcall OnStartPending(void* app, void*) {
     const bool roomSnapshot = logEvent && app == markedGuestApp &&
         Read<unsigned>(app, AppNetManager + NetFrame) == markedGuestFrame &&
         Read<uint8_t>(app, AppHasPendingSnapshot) != 0;
+    const bool previousLoading = loadingRoomSnapshot;
+    loadingRoomSnapshot = previousLoading || roomSnapshot;
     originalStartPending(app);
+    loadingRoomSnapshot = previousLoading;
     if (roomSnapshot && Read<unsigned>(app, 8) == 2 &&
         Read<uint8_t>(app, AppHasPendingSnapshot) == 0) {
         markedGuestApp = nullptr;
@@ -954,6 +1207,10 @@ void EnableRoomRejoin(Log logger) {
     originalCaptureGameState = At<CaptureGameState>(CaptureGameStateRva);
     originalGameUpdate = At<UpdateGame>(GameUpdateRva);
     originalJoinEntityPass = At<JoinEntityPass>(JoinEntityPassRva);
+    originalCapturePlayerState = At<CapturePlayerState>(CapturePlayerStateRva);
+    originalRestorePlayerState = At<RestorePlayerState>(RestorePlayerStateRva);
+    restoreSavedFamiliars = At<RestorePlayerState>(RestoreSavedFamiliarsRva);
+    originalPreviewTrinketStats = At<PreviewTrinketStats>(PreviewTrinketStatsRva);
     processPendingJoins = At<ProcessPendingJoins>(ProcessJoinsRva);
     broadcastFrameInput = At<BroadcastFrameInput>(BroadcastInputRva);
     if (!PatchCall(RoomUpdateCallRva, {0xE8, 0x7F, 0x63, 0x13, 0x00}, reinterpret_cast<uintptr_t>(OnRoomUpdate)) ||
@@ -965,12 +1222,34 @@ void EnableRoomRejoin(Log logger) {
         !PatchCall(GameUpdateCallRva, {0xE8, 0x8A, 0x5B, 0xDA, 0xFF}, reinterpret_cast<uintptr_t>(OnGameUpdate)) ||
         !PatchCall(CaptureSnapshotCallRva, {0xE8, 0xF2, 0x1A, 0xDE, 0xFF}, reinterpret_cast<uintptr_t>(OnCaptureRoomSnapshot)) ||
         !PatchCall(WriteParityRva, {0x88, 0x85, 0xC3, 0x01, 0xFE, 0xFF}, reinterpret_cast<uintptr_t>(OnWriteParity)) ||
-        !PatchCall(ReadParityRva, {0x0F, 0xB6, 0x4D, 0xF3, 0x83, 0xE1, 0x01}, reinterpret_cast<uintptr_t>(OnReadParity))) {
+        !PatchCall(ReadParityRva, {0x0F, 0xB6, 0x4D, 0xF3, 0x83, 0xE1, 0x01}, reinterpret_cast<uintptr_t>(OnReadParity)) ||
+        !PatchCall(CaptureLeavingPlayerCallRva, {0xE8, 0x10, 0xAA, 0xEA, 0xFF},
+                   reinterpret_cast<uintptr_t>(OnCaptureLeavingPlayer)) ||
+        // These three sites must execute the native room-entry and weapon logic.
+        // Rewriting them also removes the hooks from an already loaded hotfix.
+        !PatchCall(PrepareRoomEntitiesCallRva, {0xE8, 0x2C, 0xD7, 0xEC, 0xFF},
+                   image + PrepareRoomEntitiesRva) ||
+        !PatchCall(IncubusWeaponCallRva, {0xE8, 0x17, 0x08, 0x01, 0x00},
+                   image + FamiliarWeaponUpdateRva) ||
+        !PatchCall(TwistedBabyWeaponCallRva, {0xE8, 0xA3, 0xAB, 0x00, 0x00},
+                   image + FamiliarWeaponUpdateRva) ||
+        !PatchCall(RestoreCachedPlayerCallRva, {0xE8, 0x66, 0x1B, 0xEA, 0xFF},
+                   reinterpret_cast<uintptr_t>(OnRestoreCachedPlayer)) ||
+        !PatchCall(RestoredFamiliarUpdateCallRva, {0x8B, 0xCF, 0xFF, 0x50, 0x0C},
+                   reinterpret_cast<uintptr_t>(OnRestoredFamiliarUpdate)) ||
+        !PatchCall(PreviewAddedTrinketCallRva, {0xE8, 0x18, 0x0C, 0x00, 0x00},
+                   reinterpret_cast<uintptr_t>(OnPreviewTrinketStats)) ||
+        !PatchCall(PreviewRemovedTrinketCallRva, {0xE8, 0xA4, 0x08, 0x00, 0x00},
+                   reinterpret_cast<uintptr_t>(OnPreviewTrinketStats)) ||
+        // Restore the native call, including when replacing an active v14 hotfix.
+        !PatchCall(SeedDeathmatchRoomCallRva, {0xE8, 0x2A, 0xFB, 0xFF, 0xFF},
+                   image + SeedRoomDescriptorRva) ||
+        !RestoreFamiliarInitialize()) {
         logger(0, "room_rejoin_unavailable", "patch_call", 0, -1, -1);
         return;
     }
     logEvent = logger;
-    logEvent(0, "room_rejoin_ready", "room_snapshot_v11", 0, -1, -1);
+    logEvent(0, "room_rejoin_ready", BetterCoop::RoomSnapshotMarker, 0, -1, -1);
 }
 
 // Used by the hotfix: patch with a silent logger while other threads are
@@ -978,26 +1257,8 @@ void EnableRoomRejoin(Log logger) {
 void SetRoomRejoinLogger(Log logger) {
     if (logEvent) {
         logEvent = logger;
-        logEvent(0, "room_rejoin_ready", "room_snapshot_v11_hotfix", 0, -1, -1);
+        logEvent(0, "room_rejoin_ready", BetterCoop::HotfixMarker, 0, -1, -1);
     }
-}
-
-// Used by the hotfix: an earlier build could leave a solo host frozen after a
-// failed join. Only touches a lone player, so no remote peer can diverge.
-void ReleaseStuckSoloControls() {
-    const auto app = *At<const uint8_t**>(AppRva);
-    const auto game = *At<const void**>(GameRva);
-    if (!logEvent || !app || !game || Read<unsigned>(app, 8) != 2) {
-        return;
-    }
-    const auto players = Read<uint8_t* const*>(game, GamePlayers);
-    const auto end = Read<uint8_t* const*>(game, GamePlayers + 4);
-    if (!players || end != players + 1 || !players[0] || players[0][PlayerControlsEnabled] != 0) {
-        return;
-    }
-    const int released = ReleaseAllControls(game);
-    logEvent(0, "room_rejoin_controls", released > 0 ? "solo_unstuck" : "solo_unstuck_failed",
-             Read<unsigned>(app, AppNetManager + NetFrame), released, Read<int>(game, GameRoomIndex));
 }
 
 void InitializeRoomRejoin(Log logger) {
