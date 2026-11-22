@@ -6,10 +6,14 @@
 #include <cstring>
 #include <cwchar>
 #include <vector>
+#include "call_patch.h"
+#include "game_build.h"
 
 const char* IsaacPrivatePairBlockReason(uintptr_t imageBase, uint64_t local, uint64_t peer);
 
 namespace {
+
+using namespace IsaacRelease;
 
 using SteamId = uint64_t;
 using Log = void (*)(SteamId, const char*, const char*, unsigned, int, int);
@@ -17,20 +21,30 @@ using BuildStream = void* (__thiscall *)(void*, int);
 using DestroyStream = void (__thiscall *)(void*);
 using WriteStream = unsigned (__thiscall *)(void*, const void*, unsigned, unsigned);
 using BroadcastStart = int (__thiscall *)(void*);
+using EncodeProgress = void* (__thiscall *)(const void*, unsigned*);
 
-constexpr uintptr_t AppRva = 0x87169C;
-constexpr uintptr_t GameRva = 0x871678;
-constexpr uintptr_t FinalizeRva = 0x50CD10;
-constexpr uintptr_t BuildMessageRva = 0x516F70;
-constexpr uintptr_t BroadcastRva = 0x4EE080;
-constexpr uintptr_t BuildStreamRva = 0x658040;
-constexpr uintptr_t DestroyStreamRva = 0x658200;
-constexpr std::array<uintptr_t, 2> ExitCalls{0x559D7A, 0x5AB77B};
-constexpr std::array<uintptr_t, 2> StartCalls{0x4EAB87, 0x4EAC96};
-constexpr uintptr_t BuildMessageCall = 0x4EE274;
+constexpr uintptr_t FinalizeRva = 0x51D610;
+constexpr uintptr_t WriteSnapshotRva = 0x52B860;
+constexpr uintptr_t EncodeProgressRva = 0x52F940;
+constexpr uintptr_t FreeProgressRva = 0x684120;
+constexpr uintptr_t BroadcastRva = 0x4F8850;
+constexpr uintptr_t BuildStreamRva = 0x672E30;
+constexpr uintptr_t DestroyStreamRva = 0x672F80;
+constexpr uintptr_t ExitMenuCall = 0x56F92A;
+constexpr uintptr_t ShutdownCall = 0x5C285B;
+constexpr uintptr_t GuestReadyStartCall = 0x4F4F97;
+constexpr uintptr_t LobbyStartCall = 0x4F50B4;
+constexpr uintptr_t NewGameWriterCall = 0x52B496;
+constexpr uintptr_t NewGameWriterRva = 0x52B540;
+constexpr size_t AppSharedProgress = 313152;
+constexpr size_t GameSnapshotMode = 0x26E68;
+constexpr size_t GameSnapshotParameter = 0x26594;
+constexpr size_t GameRunMode = 157224;
+constexpr size_t GameSpecialRunState = 157252;
 constexpr unsigned MaximumPacketBytes = 1024 * 1024;
 constexpr unsigned MaximumGameStateBytes = 8 * 1024 * 1024;
-constexpr char Magic[] = "INDRUN01";
+constexpr char Magic[] = "INDRUN02";
+constexpr char LegacyMagic[] = "INDRUN01";
 
 struct Header {
     char magic[8];
@@ -43,7 +57,9 @@ static_assert(sizeof(Header) == 32);
 
 uintptr_t image;
 uintptr_t gameFinalize;
-uintptr_t gameBuildMessage;
+uintptr_t gameWriteSnapshot;
+uintptr_t gameFreeProgress;
+uintptr_t gameNewGameWriter;
 bool saveEnabled;
 bool resumeArmed;
 bool resumePayloadValid;
@@ -98,10 +114,11 @@ bool ValidatePacket(const uint8_t* bytes, unsigned size, SteamId owner, SteamId 
     unsigned pos = 48 + packed;
     const unsigned statsCount = bytes[pos++];
     constexpr unsigned TailBeforeRoster = 4 + 624 * 4 + 1 + 4 + 1 + 4 + 8;
-    if (size - pos < statsCount * 96 + TailBeforeRoster + 8) {
+    constexpr unsigned StatsEntryBytes = 8 + 22 * 4;
+    if (size - pos < statsCount * StatsEntryBytes + TailBeforeRoster + 8) {
         return false;
     }
-    pos += statsCount * 96 + TailBeforeRoster;
+    pos += statsCount * StatsEntryBytes + TailBeforeRoster;
     const uint64_t otherIds = Read<uint64_t>(bytes, pos);
     pos += 8;
     if (otherIds > (size - pos) / 8) {
@@ -171,9 +188,12 @@ bool LoadFile() {
     if (file == INVALID_HANDLE_VALUE) {
         return false;
     }
+    // Release reads the beta GameState version (169) and uses the same
+    // type-5 body. The builder appends fresh release trailers on resume.
     LARGE_INTEGER length;
     bool valid = GetFileSizeEx(file, &length) && ReadExact(file, &resumeHeader, sizeof(resumeHeader)) &&
-        std::memcmp(resumeHeader.magic, Magic, sizeof(resumeHeader.magic)) == 0 &&
+        (std::memcmp(resumeHeader.magic, Magic, sizeof(resumeHeader.magic)) == 0 ||
+         std::memcmp(resumeHeader.magic, LegacyMagic, sizeof(resumeHeader.magic)) == 0) &&
         resumeHeader.size <= MaximumPacketBytes && resumeHeader.size >= 49 &&
         length.QuadPart == sizeof(resumeHeader) + resumeHeader.size;
     if (valid) {
@@ -185,38 +205,51 @@ bool LoadFile() {
         ValidatePacket(resumePayload.data(), resumeHeader.size, resumeHeader.owner, resumeHeader.partner);
 }
 
-// The original routines use ECX/EDX plus caller-cleaned stack arguments.
-__declspec(naked) void __cdecl CaptureMessage(void*, int, int, void*) {
+// Serialize the type-5 body directly. The outer builder advances the network
+// generation and writes lobby progress, which should only happen on a start.
+__declspec(naked) void __cdecl CaptureMessage(void*, int, int, const void*, unsigned) {
     __asm {
         push ebp
         mov ebp, esp
-        push 0                  // forceNewGameMessage
-        push dword ptr [ebp+20]  // shared progress state
-        push 0                  // seed pointer, used only by the new-game branch
+        push dword ptr [ebp+24]  // compressed progress size
+        push dword ptr [ebp+20]  // compressed progress data
         push dword ptr [ebp+16]  // lobby/game parameter
         mov edx, [ebp+12]
         mov ecx, [ebp+8]
-        call dword ptr [gameBuildMessage]
-        add esp, 16
+        call dword ptr [gameWriteSnapshot]
+        add esp, 12
         pop ebp
         ret
     }
 }
 
+__declspec(naked) void __cdecl FreeEncodedProgress(void*) {
+    __asm {
+        push dword ptr [esp+4]
+        mov edx, 1
+        push 0
+        push 0
+        mov cl, dl
+        call dword ptr [gameFreeProgress]
+        add esp, 12
+        ret
+    }
+}
+
 bool ActivePair(const uint8_t* app, const uint8_t* game, SteamId& owner, SteamId& partner) {
-    const auto roster = Read<uintptr_t>(app, 307832);
-    const auto devices = Read<uintptr_t>(app, 308184);
-    const auto players = Read<uintptr_t>(game, 113320);
-    const auto playersEnd = Read<uintptr_t>(game, 113324);
-    if (!roster || Read<uintptr_t>(app, 307836) != roster + 40 ||
-        !devices || Read<uintptr_t>(app, 308188) != devices + 8 ||
+    const auto roster = Read<uintptr_t>(app, AppRoster);
+    const auto devices = Read<uintptr_t>(app, AppNetManager);
+    const auto players = Read<uintptr_t>(game, GamePlayers);
+    const auto playersEnd = Read<uintptr_t>(game, GamePlayers + 4);
+    if (!roster || Read<uintptr_t>(app, AppRoster + 4) != roster + 40 ||
+        !devices || Read<uintptr_t>(app, AppNetManager + 4) != devices + 8 ||
         !players || playersEnd < players + 8 || playersEnd > players + 128 || (playersEnd - players) % 4) {
         return false;
     }
     std::array<SteamId, 2> deviceUsers{};
     for (unsigned i = 0; i < 2; ++i) {
         const auto device = Read<const uint8_t*>(reinterpret_cast<const void*>(devices), i * 4);
-        const auto profile = device ? Read<const void*>(device, 884) : nullptr;
+        const auto profile = device ? Read<const void*>(device, DeviceProfile) : nullptr;
         if (!profile) {
             return false;
         }
@@ -256,22 +289,23 @@ void __cdecl SaveBeforeTeardown() {
     const auto app = *At<uint8_t**>(AppRva);
     const auto game = *At<uint8_t**>(GameRva);
     if (!saveEnabled || resumeArmed || !app || !game || Read<unsigned>(app, 8) != 2 ||
-        !Read<uint8_t>(app, 307828)) {
+        !Read<uint8_t>(app, AppOnlineRun)) {
         return;
     }
-    const auto frame = Read<unsigned>(app, 308196);
-    const auto index = Read<int>(game, 99076);
-    const auto room = Read<const void*>(game, 99072);
+    const auto frame = Read<unsigned>(app, AppNetManager + NetFrame);
+    const auto index = Read<int>(game, GameRoomIndex);
+    const auto room = Read<const void*>(game, GameRoom);
     const auto descriptor = room ? Read<const void*>(room, 4) : nullptr;
     SteamId owner = 0;
     SteamId partner = 0;
     const char* reason = nullptr;
     if (!descriptor || !(Read<uint8_t>(descriptor, 68) & 1) || Read<unsigned>(game) == 0 ||
-        Read<unsigned>(game, 112700) || Read<unsigned>(game, 113272)) {
+        Read<unsigned>(game, GameRoomTransition) || Read<unsigned>(game, GameStageTransition)) {
         reason = "room_not_stable_and_clear";
-    } else if (Read<unsigned>(game, 157204) >= 2 || Read<unsigned>(game, 157232)) {
+    } else if (Read<unsigned>(game, GameRunMode) >= 2 || Read<unsigned>(game, GameSpecialRunState)) {
         reason = "unsupported_run_mode";
-    } else if (Read<unsigned>(app, 308184 + 4552) || Read<unsigned>(app, 308184 + 6248)) {
+    } else if (Read<unsigned>(app, AppNetManager + NetDesyncState) ||
+               Read<unsigned>(app, AppNetManager + NetPendingCount)) {
         reason = "network_transition_pending";
     } else if (!ActivePair(app, game, owner, partner)) {
         reason = "two_active_characters_required";
@@ -283,9 +317,20 @@ void __cdecl SaveBeforeTeardown() {
         return;
     }
 
+    unsigned progressSize = 0;
+    const auto progress = At<EncodeProgress>(EncodeProgressRva)(app + AppSharedProgress, &progressSize);
+    if (!progress || progressSize > MaximumPacketBytes) {
+        if (progress) {
+            FreeEncodedProgress(progress);
+        }
+        logger(partner, "online_checkpoint_failed", "encode_progress", frame, index, index);
+        return;
+    }
     alignas(8) uint8_t stream[44]{};
     At<BuildStream>(BuildStreamRva)(stream, 0);
-    CaptureMessage(stream, Read<int>(app, 307420), Read<int>(app, 307424), app + 312304);
+    CaptureMessage(stream, Read<int>(game, GameSnapshotMode), Read<int>(game, GameSnapshotParameter),
+                   progress, progressSize);
+    FreeEncodedProgress(progress);
     const auto bytes = Read<const uint8_t*>(stream, 24);
     const auto size = Read<unsigned>(stream, 4);
     const auto data = bytes ? bytes : Read<const uint8_t*>(stream, 12);
@@ -322,11 +367,13 @@ void __cdecl InjectPacket(void* stream) {
     auto* writer = static_cast<uint8_t*>(stream) + 40;
     const auto vtable = Read<const void*>(writer);
     const auto write = Read<WriteStream>(vtable, 28);
-    write(writer, resumePayload.data(), 1, resumeHeader.size);
+    write(writer, resumePayload.data(), resumeHeader.size, 1);
     injected = Read<unsigned>(stream, 4) == resumeHeader.size;
 }
 
-__declspec(naked) void OnBuildMessage() {
+// Replace only the new-run body during a resume. The native builder still
+// appends RUN1 (input generation) and RCPS (committed player progress).
+__declspec(naked) void OnWriteNewGame() {
     __asm {
         cmp byte ptr [injecting], 0
         je original_builder
@@ -335,7 +382,7 @@ __declspec(naked) void OnBuildMessage() {
         add esp, 4
         ret
     original_builder:
-        jmp dword ptr [gameBuildMessage]
+        jmp dword ptr [gameNewGameWriter]
     }
 }
 
@@ -343,8 +390,10 @@ int __fastcall OnBroadcast(void* menu, void*) {
     if (!resumeArmed) {
         return At<BroadcastStart>(BroadcastRva)(menu);
     }
-    const char* reason = resumePayloadValid ?
-        IsaacPrivatePairBlockReason(image, resumeHeader.owner, resumeHeader.partner) : "checkpoint_invalid";
+    const auto game = *At<const uint8_t**>(GameRva);
+    const char* reason = !resumePayloadValid ? "checkpoint_invalid" :
+        game && Read<unsigned>(game) != 0 ? "game_in_progress" :
+        IsaacPrivatePairBlockReason(image, resumeHeader.owner, resumeHeader.partner);
     if (reason) {
         if (!lastBlock || std::strcmp(lastBlock, reason) != 0) {
             lastBlock = reason;
@@ -368,28 +417,6 @@ int __fastcall OnBroadcast(void* menu, void*) {
     return result;
 }
 
-bool MatchesCall(uintptr_t rva, uintptr_t target) {
-    const auto call = At<const uint8_t*>(rva);
-    return call[0] == 0xe8 && Read<uint32_t>(call, 1) == target - rva - 5;
-}
-
-bool PatchCall(uintptr_t rva, uintptr_t target, uintptr_t replacement) {
-    if (!MatchesCall(rva, target)) {
-        return false;
-    }
-    auto* call = At<uint8_t*>(rva);
-    DWORD oldProtection;
-    if (!VirtualProtect(call, 5, PAGE_EXECUTE_READWRITE, &oldProtection)) {
-        return false;
-    }
-    const uint32_t relative = replacement - reinterpret_cast<uintptr_t>(call + 5);
-    std::memcpy(call + 1, &relative, sizeof(relative));
-    FlushInstructionCache(GetCurrentProcess(), call, 5);
-    DWORD previous;
-    VirtualProtect(call, 5, oldProtection, &previous);
-    return true;
-}
-
 }
 
 void EnableOnlineCheckpoint(Log log, bool resume) {
@@ -399,26 +426,29 @@ void EnableOnlineCheckpoint(Log log, bool resume) {
     }
     logger = log;
     image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto dos = At<const IMAGE_DOS_HEADER*>(0);
-    const auto nt = At<const IMAGE_NT_HEADERS*>(dos->e_lfanew);
-    if (nt->OptionalHeader.SizeOfImage < 0x879A7C) {
-        logger(0, "online_checkpoint_unavailable", "image_size", 0, -1, -1);
+    if (!MatchesLoadedImage(image)) {
+        logger(0, "online_checkpoint_unavailable", "game_image", 0, -1, -1);
         return;
     }
     gameFinalize = image + FinalizeRva;
-    gameBuildMessage = image + BuildMessageRva;
-    saveEnabled = MatchesCall(ExitCalls[0], FinalizeRva) && MatchesCall(ExitCalls[1], FinalizeRva) &&
-        PatchCall(ExitCalls[0], FinalizeRva, reinterpret_cast<uintptr_t>(OnFinalize)) &&
-        PatchCall(ExitCalls[1], FinalizeRva, reinterpret_cast<uintptr_t>(OnFinalize));
+    gameWriteSnapshot = image + WriteSnapshotRva;
+    gameFreeProgress = image + FreeProgressRva;
+    gameNewGameWriter = image + NewGameWriterRva;
+    const CallPatch exitPatches[]{
+        RedirectCall(ExitMenuCall, FinalizeRva, reinterpret_cast<uintptr_t>(OnFinalize)),
+        RedirectCall(ShutdownCall, FinalizeRva, reinterpret_cast<uintptr_t>(OnFinalize)),
+    };
+    saveEnabled = InstallCallPatches(image, exitPatches);
     logger(0, saveEnabled ? "online_checkpoint_ready" : "online_checkpoint_unavailable",
         saveEnabled ? "before_exit" : "exit_call_sites", 0, -1, -1);
     if (resume) {
         resumePayloadValid = LoadFile();
-        resumeArmed = MatchesCall(BuildMessageCall, BuildMessageRva) &&
-            MatchesCall(StartCalls[0], BroadcastRva) && MatchesCall(StartCalls[1], BroadcastRva) &&
-            PatchCall(BuildMessageCall, BuildMessageRva, reinterpret_cast<uintptr_t>(OnBuildMessage)) &&
-            PatchCall(StartCalls[0], BroadcastRva, reinterpret_cast<uintptr_t>(OnBroadcast)) &&
-            PatchCall(StartCalls[1], BroadcastRva, reinterpret_cast<uintptr_t>(OnBroadcast));
+        const CallPatch resumePatches[]{
+            RedirectCall(NewGameWriterCall, NewGameWriterRva, reinterpret_cast<uintptr_t>(OnWriteNewGame)),
+            RedirectCall(GuestReadyStartCall, BroadcastRva, reinterpret_cast<uintptr_t>(OnBroadcast)),
+            RedirectCall(LobbyStartCall, BroadcastRva, reinterpret_cast<uintptr_t>(OnBroadcast)),
+        };
+        resumeArmed = InstallCallPatches(image, resumePatches);
         logger(resumeHeader.partner, resumeArmed && resumePayloadValid ? "online_resume_ready" : "online_resume_unavailable",
             !resumeArmed ? "start_call_sites" : resumePayloadValid ? "checkpoint_loaded" : "checkpoint_invalid", 0, -1, -1);
         if (!resumeArmed) {

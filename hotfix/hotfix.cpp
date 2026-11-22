@@ -6,15 +6,15 @@
 #include <tlhelp32.h>
 #include <cstdint>
 #include <cwchar>
+#include "../game_build.h"
 
 using OnlineEvent = void (*)(uint64_t, const char*, const char*, unsigned, int, int);
-void EnableRoomRejoin(OnlineEvent logger);
+bool EnableRoomRejoin(OnlineEvent logger, bool replaceExisting);
 void SetRoomRejoinLogger(OnlineEvent logger);
 
 namespace {
 
 using GameLog = void (__cdecl *)(int, const char*, ...);
-constexpr uintptr_t GameLogRva = 0x6112C0;
 constexpr DWORD MaxThreads = 512;
 
 DWORD threadIds[MaxThreads];
@@ -23,7 +23,8 @@ HANDLE threads[MaxThreads];
 void SilentEvent(uint64_t, const char*, const char*, unsigned, int, int) {}
 
 void GameLogEvent(uint64_t peer, const char* event, const char* reason, unsigned frame, int from, int to) {
-    const auto log = reinterpret_cast<GameLog>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + GameLogRva);
+    const auto log = reinterpret_cast<GameLog>(
+        reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + IsaacRelease::GameLogRva);
     log(1, "[BetterCoop] [Frame %u] %s: %s (from=%d to=%d peer=%llu)\n", frame, event, reason, from, to, peer);
 }
 
@@ -31,7 +32,9 @@ DWORD WINAPI Install(void*) {
     wchar_t path[MAX_PATH];
     const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
     const wchar_t* name = length && length < MAX_PATH ? std::wcsrchr(path, L'\\') : nullptr;
-    if (!name || _wcsicmp(name + 1, L"isaac-ng.exe") != 0) {
+    const auto image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (!name || _wcsicmp(name + 1, L"isaac-ng.exe") != 0 ||
+        !IsaacRelease::MatchesLoadedImage(image) || !IsaacRelease::MatchesGameFile(path)) {
         return 1;
     }
 
@@ -57,15 +60,25 @@ DWORD WINAPI Install(void*) {
         }
     }
 
-    for (DWORD i = 0; i < opened; ++i) {
-        SuspendThread(threads[i]);
+    DWORD suspended = 0;
+    for (; suspended < opened; ++suspended) {
+        if (SuspendThread(threads[suspended]) == static_cast<DWORD>(-1)) {
+            break;
+        }
     }
-    EnableRoomRejoin(SilentEvent);
-    for (DWORD i = 0; i < opened; ++i) {
+    const bool installed = opened == count && suspended == opened && EnableRoomRejoin(SilentEvent, true);
+    for (DWORD i = 0; i < suspended; ++i) {
         ResumeThread(threads[i]);
+    }
+    for (DWORD i = 0; i < opened; ++i) {
         CloseHandle(threads[i]);
     }
 
+    if (!installed) {
+        GameLogEvent(0, "room_rejoin_unavailable",
+                     suspended == count ? "patch_call" : "suspend_threads", 0, -1, -1);
+        return 3;
+    }
     SetRoomRejoinLogger(GameLogEvent);
     return 0;
 }

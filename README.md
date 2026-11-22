@@ -20,7 +20,7 @@
 | Второй игрок с возвратом через дверь | `-RoomRejoin` |
 | Хост продолжает сохранённый забег | `-RoomRejoin -ResumeOnline` |
 
-Для входа через дверь у обоих игроков должна стоять одна версия мода. Мод рассчитан на конкретную сборку игры. Если после обновления Steam изменится `isaac-ng.exe`, мод покажет предупреждение и отключит свои функции. Для удаления мода уберите его `winmm.dll` из папки игры.
+Для входа через дверь у обоих игроков должна стоять одна версия мода. v23 рассчитана на Steam-сборку Repentance+ с SHA-256 `isaac-ng.exe`, начинающимся на `024ED730`. Для предыдущей сборки (`11467365`) используйте v20. Для beta/J460 используйте v19. Если после обновления Steam изменится `isaac-ng.exe`, мод покажет предупреждение и отключит свои функции. Для удаления мода уберите его `winmm.dll` из папки игры.
 
 ### Как вернуться на том же этаже
 
@@ -34,7 +34,7 @@
 2. Чтобы продолжить, хост перезапускает игру с `-RoomRejoin -ResumeOnline`, создаёт приватное лобби или лобби для друзей, приглашает того же игрока и запускает забег через меню лобби.
 3. `-ResumeOnline` также включает сохранение при следующем выходе. Для нового забега замените его на `-SaveOnline`.
 
-У хоста есть один слот чекпоинта в `tools/IsaacNetDiag/saves/online-run.ind` относительно папки игры. Новое успешное сохранение заменяет предыдущее.
+У хоста есть один слот чекпоинта в `tools/IsaacNetDiag/saves/online-run.ind` относительно папки игры. v23 читает файлы чекпоинтов v20 и v19. Продолжение забега, сохранённого в beta/J460, в release ещё не проверено вдвоём. Новое успешное сохранение заменяет предыдущее. Продолжение чекпоинта на новой сборке игры ещё требует проверки вдвоём.
 
 ### Известные ограничения
 
@@ -66,7 +66,7 @@
 | Second player using room rejoin | `-RoomRejoin` |
 | Host resuming a saved run | `-RoomRejoin -ResumeOnline` |
 
-Both players need the same version of the mod for room rejoin. The mod targets a specific game build. If a Steam update changes `isaac-ng.exe`, the mod displays a warning and disables its features. To uninstall the mod, remove its `winmm.dll` from the game folder.
+Both players need the same version of the mod for room rejoin. v23 targets the Steam build of Repentance+ whose `isaac-ng.exe` SHA-256 starts with `024ED730`. Use v20 for the previous build (`11467365`). Use v19 for beta/J460. If a Steam update changes `isaac-ng.exe`, the mod displays a warning and disables its features. To uninstall the mod, remove its `winmm.dll` from the game folder.
 
 ### Rejoining on the same floor
 
@@ -80,7 +80,7 @@ Both players need the same version of the mod for room rejoin. The mod targets a
 2. To resume, the host restarts the game with `-RoomRejoin -ResumeOnline`, opens a private or friends-only lobby, invites the same player, and starts the run from the lobby.
 3. `-ResumeOnline` also enables saving the next time the host exits. Switch to `-SaveOnline` to start a new run.
 
-The host has one checkpoint slot at `tools/IsaacNetDiag/saves/online-run.ind` inside the game folder. Each successful save replaces the previous checkpoint.
+The host has one checkpoint slot at `tools/IsaacNetDiag/saves/online-run.ind` inside the game folder. v23 reads checkpoint files from v20 and v19. Resuming a beta/J460 run on release still needs a two-player test. Each successful save replaces the previous checkpoint. Resuming an existing checkpoint on the new game build still needs a two-player test.
 
 ### Known limitations
 

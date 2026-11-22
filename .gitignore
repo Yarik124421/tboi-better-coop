@@ -3,3 +3,5 @@
 /friend/
 *.dll
 *.ind
+AGENTS.md
+/idb

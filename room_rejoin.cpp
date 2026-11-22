@@ -1,13 +1,18 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include "call_patch.h"
+#include "game_build.h"
 #include "version.h"
 
 namespace {
+
+using namespace IsaacRelease;
 
 using SteamId = uint64_t;
 using Log = void (*)(SteamId, const char*, const char*, unsigned, int, int);
@@ -15,15 +20,14 @@ using UpdateRoomTransition = int (__thiscall *)(void*);
 using ProcessPendingJoins = void (__thiscall *)(void*, char);
 using UpdateNetManager = bool (__thiscall *)(void*);
 using BroadcastFrameInput = void (__thiscall *)(void*, unsigned);
-using StartPendingGame = void (__thiscall *)(void*);
+using StartPendingGame = int (__thiscall *)(void*);
 using RestoreJoinedGame = int (__thiscall *)(void*, void*, int, int);
 using CaptureGameState = int (__thiscall *)(void*, void*);
-using UpdateGame = void (__thiscall *)(void*);
+using UpdateGame = int (__thiscall *)(void*);
 using JoinEntityPass = int (__cdecl *)();
 using CapturePlayerState = int (__thiscall *)(void*, void*, int);
 using RestorePlayerState = int (__thiscall *)(void*, const void*);
 using UpdateRestoredFamiliar = int (__thiscall *)(void*);
-using PreviewTrinketStats = void (__thiscall *)(void*, char, int);
 using GetMatchmaking = void* (__cdecl *)();
 using GetLobbyOwner = SteamId (__cdecl *)(void*, SteamId);
 using GetLobbyMemberCount = int (__cdecl *)(void*, SteamId);
@@ -32,60 +36,42 @@ using GetLobbyData = const char* (__cdecl *)(void*, SteamId, const char*);
 using GetLobbyMemberData = const char* (__cdecl *)(void*, SteamId, SteamId, const char*);
 using SetLobbyMemberData = void (__cdecl *)(void*, SteamId, const char*, const char*);
 
-// RVAs and object offsets for the image validated by Start-NetDiag.ps1.
-constexpr uintptr_t RoomUpdateCallRva = 0x2FB51C;
-constexpr uintptr_t RoomUpdateRva = 0x4318A0;
-constexpr uintptr_t ProcessJoinsRva = 0x50DF40;
-constexpr uintptr_t NetUpdateCallRva = 0x5550AD;
-constexpr uintptr_t NetUpdateRva = 0x50B150;
-constexpr uintptr_t BroadcastInputRva = 0x502950;
-constexpr uintptr_t StartPendingCallRva = 0x554D5E;
-constexpr uintptr_t StartPendingRva = 0x559720;
-constexpr uintptr_t WriteParityRva = 0x517882;
-constexpr uintptr_t ReadParityRva = 0x5185AA;
-constexpr uintptr_t RestoreHostCallRva = 0x5187CB;
-constexpr uintptr_t RestoreJoinedGameRva = 0x50E2A0;
-constexpr uintptr_t CaptureSnapshotCallRva = 0x517509;
-constexpr uintptr_t CaptureGameStateRva = 0x2F9000;
-constexpr uintptr_t GameUpdateCallRva = 0x555231;
-constexpr uintptr_t GameUpdateRva = 0x2FADC0;
-constexpr uintptr_t HostJoinPassCallRva = 0x50CCF7;
-constexpr uintptr_t JoinEntityPassRva = 0x50D3F0;
-constexpr uintptr_t GuestJoinPassCallRva = 0x2F5990;
-constexpr uintptr_t FamiliarInitializeRva = 0x20DE70;
-constexpr uintptr_t FamiliarInitializeSlotRva = 0x764920;
-constexpr uintptr_t CaptureLeavingPlayerCallRva = 0x5061CB;
-constexpr uintptr_t CapturePlayerStateRva = 0x3B0BE0;
-constexpr uintptr_t PrepareRoomEntitiesCallRva = 0x430BBF;
-constexpr uintptr_t PrepareRoomEntitiesRva = 0x2FE2F0;
-constexpr uintptr_t IncubusWeaponCallRva = 0x21DE04;
-constexpr uintptr_t TwistedBabyWeaponCallRva = 0x223A78;
-constexpr uintptr_t FamiliarWeaponUpdateRva = 0x22E620;
-constexpr uintptr_t RestoreCachedPlayerCallRva = 0x50C945;
-constexpr uintptr_t RestorePlayerStateRva = 0x3AE4B0;
-constexpr uintptr_t RestoreSavedFamiliarsRva = 0x3B0070;
-constexpr uintptr_t RestoredFamiliarUpdateCallRva = 0x230C5F;
-constexpr uintptr_t PreviewAddedTrinketCallRva = 0x44DEF3;
-constexpr uintptr_t PreviewRemovedTrinketCallRva = 0x44E267;
-constexpr uintptr_t PreviewTrinketStatsRva = 0x44EB10;
-constexpr uintptr_t SeedDeathmatchRoomCallRva = 0x28E11;
-constexpr uintptr_t SeedRoomDescriptorRva = 0x28940;
+// Verified x86 entry points and call sites in the release EXE.
+constexpr uintptr_t RoomUpdateCallRva = 0x3021BC;
+constexpr uintptr_t RoomUpdateRva = 0x43A330;
+constexpr uintptr_t ProcessJoinsRva = 0x520610;
+constexpr uintptr_t NetUpdateCallRva = 0x56A8CD;
+constexpr uintptr_t NetUpdateRva = 0x51B080;
+constexpr uintptr_t BroadcastInputRva = 0x510B10;
+constexpr uintptr_t StartPendingCallRva = 0x56A57E;
+constexpr uintptr_t StartPendingRva = 0x56F1E0;
+constexpr uintptr_t WriteParityRva = 0x52BF3C;
+constexpr uintptr_t ReadParityRva = 0x52CDBA;
+constexpr uintptr_t RestoreHostCallRva = 0x52D128;
+constexpr uintptr_t RestoreJoinedGameRva = 0x520A60;
+constexpr uintptr_t CaptureSnapshotCallRva = 0x52BAF0;
+constexpr uintptr_t CaptureGameStateRva = 0x2FF9A0;
+constexpr uintptr_t GameUpdateCallRva = 0x56AA51;
+constexpr uintptr_t GameUpdateRva = 0x301950;
+constexpr uintptr_t HostJoinPassCallRva = 0x51D5CF;
+constexpr uintptr_t JoinEntityPassRva = 0x51DA10;
+constexpr uintptr_t GuestJoinPassCallRva = 0x2FC300;
+constexpr uintptr_t CaptureLeavingPlayerCallRva = 0x51464B;
+constexpr uintptr_t CapturePlayerStateRva = 0x3B95F0;
+constexpr uintptr_t RestoreCachedPlayerCallRva = 0x51D1B5;
+constexpr uintptr_t RestorePlayerStateRva = 0x3B7030;
+constexpr uintptr_t RestoreSavedFamiliarsRva = 0x3B8C50;
+constexpr uintptr_t RestoredFamiliarUpdateCallRva = 0x2377AF;
 // Global MT19937 used for the frame checksum. The join message carries it.
-constexpr uintptr_t GlobalRngStateRva = 0x87AC70;
-constexpr uintptr_t GlobalRngIndexRva = 0x834F04;
+constexpr uintptr_t GlobalRngStateRva = 0x89FC20;
+constexpr uintptr_t GlobalRngIndexRva = 0x85C454;
 constexpr size_t GlobalRngWords = 624;
-constexpr uintptr_t GameRva = 0x871678;
-constexpr uintptr_t AppRva = 0x87169C;
-constexpr uintptr_t CurrentLobbyRva = 0x879A74;
-constexpr uintptr_t LobbySteamVtableRva = 0x79E9A4;
+constexpr uintptr_t CurrentLobbyRva = 0x89EA4C;
+constexpr uintptr_t LobbySteamVtableRva = 0x7C2388;
+constexpr size_t LobbySteamId = 0x10;
 
 constexpr size_t GameStartingRoomIndex = 99024;
-constexpr size_t GameRoom = 99072;
-constexpr size_t GameRoomIndex = 99076;
 constexpr size_t GameDimension = 99084;
-constexpr size_t GameRoomTransition = 112700;
-constexpr size_t GameStageTransition = 113272;
-constexpr size_t GamePlayers = 113320;
 constexpr size_t SavedFamiliarCount = 892;
 // ItemOverlay (transformation/giantbook style): state 0 idle, 1 delay, 2
 // showing. While showing, Game::Update skips the world update.
@@ -102,11 +88,8 @@ constexpr size_t EntityChild = 960;
 constexpr size_t EntityTarget = 964;
 constexpr size_t FamiliarOwner = 1040;
 constexpr size_t FamiliarPathfinder = 1532;
-constexpr uintptr_t GameLogRva = 0x6112C0;
 constexpr unsigned DiagFrames = 8;
 constexpr size_t PlayerControlsEnabled = 1040;
-constexpr size_t PlayerQueuedItem = 6084;
-constexpr size_t PlayerCacheFlags = 5492;
 constexpr size_t EntityFlags = 0x168;
 constexpr size_t EntityActive = 370;
 // FLAG_INTERPOLATION_UPDATE: Player::Update skips its RNG-drawing logic.
@@ -119,16 +102,9 @@ constexpr size_t PlayerBombs = 4964;
 constexpr size_t PlayerCoins = 4968;
 constexpr size_t SavedPlayerCount = 105848;
 constexpr size_t SavedPlayers = 105852;
-constexpr size_t SavedPlayerSize = 1500;
-constexpr size_t AppOnlineRun = 307828;
-constexpr size_t AppRoster = 307832;
-constexpr size_t AppNetManager = 308184;
-constexpr size_t AppHasPendingSnapshot = 307505;
-constexpr size_t NetFrame = 12;
-constexpr size_t NetDesyncState = 4552;
-constexpr size_t NetPendingHead = 6244;
-constexpr size_t NetPendingCount = 6248;
-constexpr size_t DeviceProfile = 884;
+constexpr size_t SavedPlayerSize = 1524;
+constexpr size_t AppHasPendingSnapshot = 308225;
+constexpr size_t NetPendingHead = 6452;
 constexpr size_t DeviceSentInputs = 940;
 constexpr unsigned ReplayFrames = 16;
 // Both clients simulate the join frame and the next OnlineInputDelay frames
@@ -200,7 +176,6 @@ JoinEntityPass originalJoinEntityPass;
 CapturePlayerState originalCapturePlayerState;
 RestorePlayerState originalRestorePlayerState;
 RestorePlayerState restoreSavedFamiliars;
-PreviewTrinketStats originalPreviewTrinketStats;
 // Global RNG exactly as received in the room snapshot message. Host and guest
 // run different join setup code afterwards, which draws different amounts
 // from it; both put this copy back once that setup is done.
@@ -236,38 +211,6 @@ template <typename T>
 T SteamExport(const char* name) {
     const auto steam = GetModuleHandleW(L"steam_api.dll");
     return steam ? reinterpret_cast<T>(GetProcAddress(steam, name)) : nullptr;
-}
-
-// Restore gameplay hooks left by earlier DLLs when applying this hotfix.
-bool RestoreFamiliarInitialize() {
-    auto* slot = At<uintptr_t*>(FamiliarInitializeSlotRva);
-    const auto replacement = image + FamiliarInitializeRva;
-    if (*slot == replacement) {
-        return true;
-    }
-    {
-        HMODULE previousModule = nullptr;
-        wchar_t path[MAX_PATH];
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCWSTR>(*slot), &previousModule)) {
-            return false;
-        }
-        const DWORD length = GetModuleFileNameW(previousModule, path, _countof(path));
-        const auto* name = length && length < _countof(path) ? std::wcsrchr(path, L'\\') : nullptr;
-        constexpr wchar_t hotfixPrefix[] = L"bettercoop_hotfix_v";
-        if (!name || (_wcsicmp(name + 1, L"winmm.dll") != 0 &&
-                      _wcsnicmp(name + 1, hotfixPrefix, _countof(hotfixPrefix) - 1) != 0)) {
-            return false;
-        }
-    }
-    DWORD protection;
-    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) {
-        return false;
-    }
-    InterlockedExchange(reinterpret_cast<volatile LONG*>(slot), static_cast<LONG>(replacement));
-    DWORD oldProtection;
-    VirtualProtect(slot, sizeof(*slot), protection, &oldProtection);
-    return true;
 }
 
 int __fastcall OnCaptureLeavingPlayer(void* player, void*, void* snapshot, int includeTemporary) {
@@ -321,55 +264,10 @@ __declspec(naked) void OnRestoredFamiliarUpdate() {
     }
 }
 
-struct PreviewQueueScope {
-    void* player;
-    const void* queuedItem;
-    uint32_t cacheFlags;
-
-    explicit PreviewQueueScope(void* owner)
-        : player(owner), queuedItem(Read<const void*>(owner, PlayerQueuedItem)),
-          cacheFlags(Read<uint32_t>(owner, PlayerCacheFlags)) {
-        Write<const void*>(player, PlayerQueuedItem, nullptr);
-        // The preview requests its own stat flags. Do not let it consume
-        // unrelated pending simulation work (e.g. familiar cache refresh).
-        Write<uint32_t>(player, PlayerCacheFlags, 0);
-    }
-
-    ~PreviewQueueScope() {
-        Write(player, PlayerQueuedItem, queuedItem);
-        Write(player, PlayerCacheFlags, cacheFlags);
-    }
-
-    PreviewQueueScope(const PreviewQueueScope&) = delete;
-    PreviewQueueScope& operator=(const PreviewQueueScope&) = delete;
-};
-
-void __fastcall OnPreviewTrinketStats(void* preview, void*, char adding, int golden) {
-    const auto app = *At<const uint8_t**>(AppRva);
-    const auto player = Read<void*>(preview, 72);
-    const auto queued = player ? Read<const void*>(player, PlayerQueuedItem) : nullptr;
-    if (logEvent && app && Read<unsigned>(app, 8) == 2 && Read<uint8_t>(app, AppOnlineRun) &&
-        queued && Read<int>(queued) == 2) {
-        // Preview's own trinket override supplies the hypothetical item. Do
-        // not count the real pending pickup a second time, or during its
-        // rollback evaluation. Keep the native numeric comparison intact.
-        // Both temporary queue masking and pending cache flags are restored
-        // before returning to the normal pickup/simulation path.
-        {
-            PreviewQueueScope scope(player);
-            originalPreviewTrinketStats(preview, adding, golden);
-        }
-        logEvent(0, "trinket_preview", adding ? "online_add_isolated" : "online_remove_isolated",
-                 Read<unsigned>(app, AppNetManager + NetFrame), Read<int>(preview, 4), Read<int>(queued, 4));
-        return;
-    }
-    originalPreviewTrinketStats(preview, adding, golden);
-}
-
 SteamId CurrentSteamLobby(uintptr_t imageBase) {
     const auto lobby = *reinterpret_cast<void**>(imageBase + CurrentLobbyRva);
     return lobby && Read<uintptr_t>(lobby) == imageBase + LobbySteamVtableRva
-        ? Read<SteamId>(lobby, 8) : 0;
+        ? Read<SteamId>(lobby, LobbySteamId) : 0;
 }
 
 Room CurrentRoom(const void* game) {
@@ -395,7 +293,8 @@ SteamId PendingPeer(const void* manager) {
         Read<uint8_t>(node, 13) != 0) {
         return 0;
     }
-    return Read<SteamId>(node, 16);
+    const auto profile = Read<const void*>(node, 28);
+    return profile ? Read<SteamId>(profile, 8) : 0;
 }
 
 SteamId SoloLocalPlayer(const void* app, const void* manager) {
@@ -701,7 +600,7 @@ __declspec(naked) void OnWriteParity() {
         or al, 80h
     storeParity:
         popfd
-        mov byte ptr [ebp - 1FE3Dh], al
+        mov byte ptr [ebp - 1FF69h], al
         ret
     }
 }
@@ -762,15 +661,28 @@ void ResetItemOverlay(uint8_t* game, SteamId peer, unsigned frame, const char* s
     logEvent(peer, "room_rejoin_overlay", side, frame, state, 0);
 }
 
-bool SetRestoredRoomControls(const void* game, uint8_t enabled) {
+bool IsSnapshotStageTransition(const void* game) {
+    return Read<unsigned>(game, GameStageTransition) == 2 &&
+           Read<unsigned>(game, GameStageTransition + 4) == 49 &&
+           Read<unsigned>(game, GameStageTransition + 8) == 50 &&
+           Read<uint8_t>(game, GameStageTransition + 12) == 0;
+}
+
+bool SetRestoredRoomControls(void* game, uint8_t enabled, bool allowSnapshotTransition = false) {
+    const unsigned stageTransition = Read<unsigned>(game, GameStageTransition);
     if (Read<unsigned>(game, GameRoomTransition) != 0 ||
-        Read<unsigned>(game, GameStageTransition) != 0) {
+        (stageTransition != 0 && !(allowSnapshotTransition && IsSnapshotStageTransition(game)))) {
         return false;
     }
     const auto players = Read<uint8_t* const*>(game, GamePlayers);
     const auto end = Read<uint8_t* const*>(game, GamePlayers + 4);
     if (!players || end != players + 2 || !players[0] || !players[1] || players[0] == players[1]) {
         return false;
+    }
+    if (stageTransition != 0) {
+        // Both native loaders arm this overdue floor transition. The room is
+        // already restored. Leaving the transition active can regenerate it.
+        Write<unsigned>(game, GameStageTransition, 0);
     }
     players[0][PlayerControlsEnabled] = enabled;
     players[1][PlayerControlsEnabled] = enabled;
@@ -779,10 +691,15 @@ bool SetRestoredRoomControls(const void* game, uint8_t enabled) {
 
 // Called on both clients with the same join frame. The vanilla join loader
 // leaves ControlsEnabled cleared; keep it that way until enableFrame.
-bool ArmControlGate(const void* game, const void* manager, SteamId peer, unsigned joinFrame) {
-    if (!SetRestoredRoomControls(game, 0)) {
+bool ArmControlGate(void* game, const void* manager, SteamId peer, unsigned joinFrame) {
+    const unsigned stageTransition = Read<unsigned>(game, GameStageTransition);
+    if (!SetRestoredRoomControls(game, 0, true)) {
         controlGate = {};
         return false;
+    }
+    if (stageTransition != 0) {
+        logEvent(peer, "room_rejoin_transition", "snapshot_transition_cleared", joinFrame,
+                 static_cast<int>(stageTransition), Read<int>(game, GameRoomIndex));
     }
     controlGate = {game, manager, peer, joinFrame, joinFrame + ControlDelayFrames};
     diagFirstFrame = joinFrame;
@@ -820,7 +737,7 @@ void AbandonControlGate(const void* game, const char* reason, unsigned frame) {
     controlGate = {};
 }
 
-void UpdateControlGate(const void* game) {
+void UpdateControlGate(void* game) {
     if (!controlGate.game) {
         return;
     }
@@ -885,7 +802,7 @@ void LogJoinPassPlayers(SteamId peer, const char* side) {
 // apart). Run the pass with the transition idle, exactly like the host.
 int __cdecl OnGuestJoinPass() {
     const auto game = *At<uint8_t**>(GameRva);
-    const bool roomJoin = logEvent && markedGuestApp && game;
+    const bool roomJoin = logEvent && markedGuestApp && game && IsSnapshotStageTransition(game);
     uint32_t transition[3]{};
     if (roomJoin) {
         LogJoinPassPlayers(0, "room_rejoin_guest_pass");
@@ -1018,12 +935,10 @@ void DumpEntities(const void* game, const char* when, bool force) {
         *At<const int*>(GlobalRngIndexRva), count, Read<int>(game, GameStageTransition),
         Read<int>(game, GameRoomTransition));
     // Every field Isaac_Game_Update can bail out on before the world update,
-    // plus the world frame counter (+0x264F8) that only advances past them.
-    log(1, "[BetterCoop] [Frame %u] diag %s: world_frame=%d freeze=%d m1D520=%d m1D654=%d m1C034=%d "
-        "overlay=%d:%d m26778=%d room_f4600=%.3f\n", frame, when,
-        Read<int>(game, 0x264F8), Read<int>(game, 0x264F4), Read<int>(game, 0x1D520), Read<int>(game, 0x1D654),
-        Read<int>(game, 0x1C034), Read<int>(game, 429432), Read<int>(game, 429436), Read<int>(game, 157560),
-        room ? static_cast<double>(Read<float>(room, 4600)) : -1.0);
+    // plus the world frame counter (+0x26508) that only advances past them.
+    log(1, "[BetterCoop] [Frame %u] diag %s: world_frame=%d freeze=%d m1D520=%d m1D654=%d m1C034=%d room_f4600=%.3f\n", frame, when,
+        Read<int>(game, 0x26508), Read<int>(game, 0x26504), Read<int>(game, 0x1D520), Read<int>(game, 0x1D654),
+        Read<int>(game, GameItemOverlay), room ? static_cast<double>(Read<float>(room, 4600)) : -1.0);
     for (unsigned i = 0; entities && i < count && i < 160; ++i) {
         const auto e = entities[i];
         if (!e) {
@@ -1075,7 +990,7 @@ void DumpEntities(const void* game, const char* when, bool force) {
     }
 }
 
-void __fastcall OnGameUpdate(void* game, void*) {
+int __fastcall OnGameUpdate(void* game, void*) {
     if (logEvent) {
         UpdateControlGate(game);
         ObservePlayerStats(game, "before_update");
@@ -1083,13 +998,14 @@ void __fastcall OnGameUpdate(void* game, void*) {
             DumpEntities(game, "before_update");
         }
     }
-    originalGameUpdate(game);
+    const int result = originalGameUpdate(game);
     if (logEvent) {
         ObservePlayerStats(game, "after_update");
         if (diagActive) {
             DumpEntities(game, "after_update");
         }
     }
+    return result;
 }
 
 int __fastcall OnRestoreHost(void* manager, void*, void* snapshot, int roster, int flags) {
@@ -1100,7 +1016,7 @@ int __fastcall OnRestoreHost(void* manager, void*, void* snapshot, int roster, i
     const int result = originalRestoreJoinedGame(manager, snapshot, roster, flags);
     loadingRoomSnapshot = previousLoading;
     if (roomSnapshot) {
-        const auto game = *At<const void**>(GameRva);
+        const auto game = *At<void**>(GameRva);
         const auto& room = replay.destination;
         const bool restored = game && game == room.game && Read<int>(game, GameRoomIndex) == room.index &&
             Read<int>(game, GameDimension) == room.dimension && Read<int>(game) == room.stage &&
@@ -1113,33 +1029,35 @@ int __fastcall OnRestoreHost(void* manager, void*, void* snapshot, int roster, i
     return result;
 }
 
-void __fastcall OnStartPending(void* app, void*) {
+int __fastcall OnStartPending(void* app, void*) {
     const bool roomSnapshot = logEvent && app == markedGuestApp &&
         Read<unsigned>(app, AppNetManager + NetFrame) == markedGuestFrame &&
         Read<uint8_t>(app, AppHasPendingSnapshot) != 0;
     const bool previousLoading = loadingRoomSnapshot;
     loadingRoomSnapshot = previousLoading || roomSnapshot;
-    originalStartPending(app);
+    const int result = originalStartPending(app);
     loadingRoomSnapshot = previousLoading;
     if (roomSnapshot && Read<unsigned>(app, 8) == 2 &&
         Read<uint8_t>(app, AppHasPendingSnapshot) == 0) {
         markedGuestApp = nullptr;
         auto* game = *At<uint8_t**>(GameRva);
-        if (game && Read<unsigned>(game, GameStageTransition) == 2 &&
-            Read<unsigned>(game, GameStageTransition + 4) == 49 &&
-            Read<unsigned>(game, GameStageTransition + 8) == 50) {
-            constexpr unsigned idle = 0;
-            std::memcpy(game + GameStageTransition, &idle, sizeof(idle));
-            RestoreReceivedRng(0, markedGuestFrame, "restored_guest");
-            ResetItemOverlay(game, 0, markedGuestFrame, "reset_guest");
+        if (game && IsSnapshotStageTransition(game)) {
             const bool armed = ArmControlGate(game, static_cast<uint8_t*>(app) + AppNetManager, 0, markedGuestFrame);
-            guestGame = game;
-            guestStartFrame = markedGuestFrame;
-            guestDeadline = GetTickCount64() + 8000;
+            if (armed) {
+                RestoreReceivedRng(0, markedGuestFrame, "restored_guest");
+                ResetItemOverlay(game, 0, markedGuestFrame, "reset_guest");
+                guestGame = game;
+                guestStartFrame = markedGuestFrame;
+                guestDeadline = GetTickCount64() + 8000;
+            }
             logEvent(0, "room_rejoin_guest_ready", armed ? "controls_deferred" : "unexpected_room_or_players", markedGuestFrame,
                      -1, Read<int>(game, GameRoomIndex));
+        } else if (game) {
+            logEvent(0, "room_rejoin_guest_ready", "unexpected_stage_transition", markedGuestFrame,
+                     Read<int>(game, GameStageTransition), Read<int>(game, GameRoomIndex));
         }
     }
+    return result;
 }
 
 int __fastcall OnRoomUpdate(void* transition, void*) {
@@ -1161,44 +1079,38 @@ int __fastcall OnRoomUpdate(void* transition, void*) {
     return result;
 }
 
-template <size_t N>
-bool PatchCall(uintptr_t rva, const uint8_t (&expected)[N], uintptr_t replacement) {
-    static_assert(N >= 5);
-    auto* call = At<uint8_t*>(rva);
-    // A site already redirected by an older copy of this mod (a hotfix loaded
-    // into a running game) is a call followed by NOP padding. Take it over.
-    bool hooked = call[0] == 0xE8;
-    for (size_t i = 5; hooked && i < N; ++i) {
-        hooked = call[i] == 0x90;
-    }
-    if (std::memcmp(call, expected, N) != 0 && !hooked) {
+bool IsPreviousRoomRejoinCall(const uint8_t* call, size_t length) {
+    if (call[0] != 0xE8) {
         return false;
     }
-    DWORD protection;
-    if (!VirtualProtect(call, N, PAGE_EXECUTE_READWRITE, &protection)) {
+    for (size_t i = 5; i < length; ++i) {
+        if (call[i] != 0x90) {
+            return false;
+        }
+    }
+    const auto target = reinterpret_cast<uintptr_t>(call + 5) + Read<uint32_t>(call, 1);
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(target), &memory, sizeof(memory)) ||
+        memory.Type != MEM_IMAGE || reinterpret_cast<uintptr_t>(memory.AllocationBase) == image) {
         return false;
     }
-    uint8_t bytes[N];
-    std::memset(bytes, 0x90, N);
-    bytes[0] = 0xE8;
-    const auto displacement = replacement - reinterpret_cast<uintptr_t>(call + 5);
-    std::memcpy(bytes + 1, &displacement, sizeof(displacement));
-    std::memcpy(call, bytes, N);
-    FlushInstructionCache(GetCurrentProcess(), call, N);
-    DWORD oldProtection;
-    VirtualProtect(call, N, protection, &oldProtection);
-    return true;
+    // The hotfix calls this with other threads suspended. Query the mapping
+    // directly so a thread holding the loader lock cannot block installation.
+    wchar_t path[MAX_PATH];
+    const DWORD size = K32GetMappedFileNameW(GetCurrentProcess(), memory.AllocationBase, path, MAX_PATH);
+    const auto name = size && size < MAX_PATH ? std::wcsrchr(path, L'\\') : nullptr;
+    constexpr wchar_t prefix[] = L"bettercoop_hotfix_v";
+    return name && (_wcsicmp(name + 1, L"winmm.dll") == 0 ||
+                    _wcsnicmp(name + 1, prefix, _countof(prefix) - 1) == 0);
 }
 
 }
 
-void EnableRoomRejoin(Log logger) {
+bool EnableRoomRejoin(Log logger, bool replaceExisting) {
     image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto dos = At<const IMAGE_DOS_HEADER*>(0);
-    const auto nt = At<const IMAGE_NT_HEADERS*>(dos->e_lfanew);
-    if (nt->OptionalHeader.SizeOfImage < CurrentLobbyRva + 8) {
-        logger(0, "room_rejoin_unavailable", "image_size", 0, -1, -1);
-        return;
+    if (!MatchesLoadedImage(image)) {
+        logger(0, "room_rejoin_unavailable", "game_image", 0, -1, -1);
+        return false;
     }
     originalUpdate = At<UpdateRoomTransition>(RoomUpdateRva);
     originalNetUpdate = At<UpdateNetManager>(NetUpdateRva);
@@ -1210,46 +1122,31 @@ void EnableRoomRejoin(Log logger) {
     originalCapturePlayerState = At<CapturePlayerState>(CapturePlayerStateRva);
     originalRestorePlayerState = At<RestorePlayerState>(RestorePlayerStateRva);
     restoreSavedFamiliars = At<RestorePlayerState>(RestoreSavedFamiliarsRva);
-    originalPreviewTrinketStats = At<PreviewTrinketStats>(PreviewTrinketStatsRva);
     processPendingJoins = At<ProcessPendingJoins>(ProcessJoinsRva);
     broadcastFrameInput = At<BroadcastFrameInput>(BroadcastInputRva);
-    if (!PatchCall(RoomUpdateCallRva, {0xE8, 0x7F, 0x63, 0x13, 0x00}, reinterpret_cast<uintptr_t>(OnRoomUpdate)) ||
-        !PatchCall(NetUpdateCallRva, {0xE8, 0x9E, 0x60, 0xFB, 0xFF}, reinterpret_cast<uintptr_t>(OnNetUpdate)) ||
-        !PatchCall(StartPendingCallRva, {0xE8, 0xBD, 0x49, 0x00, 0x00}, reinterpret_cast<uintptr_t>(OnStartPending)) ||
-        !PatchCall(RestoreHostCallRva, {0xE8, 0xD0, 0x5A, 0xFF, 0xFF}, reinterpret_cast<uintptr_t>(OnRestoreHost)) ||
-        !PatchCall(GuestJoinPassCallRva, {0xE8, 0x5B, 0x7A, 0x21, 0x00}, reinterpret_cast<uintptr_t>(OnGuestJoinPass)) ||
-        !PatchCall(HostJoinPassCallRva, {0xE8, 0xF4, 0x06, 0x00, 0x00}, reinterpret_cast<uintptr_t>(OnHostJoinPass)) ||
-        !PatchCall(GameUpdateCallRva, {0xE8, 0x8A, 0x5B, 0xDA, 0xFF}, reinterpret_cast<uintptr_t>(OnGameUpdate)) ||
-        !PatchCall(CaptureSnapshotCallRva, {0xE8, 0xF2, 0x1A, 0xDE, 0xFF}, reinterpret_cast<uintptr_t>(OnCaptureRoomSnapshot)) ||
-        !PatchCall(WriteParityRva, {0x88, 0x85, 0xC3, 0x01, 0xFE, 0xFF}, reinterpret_cast<uintptr_t>(OnWriteParity)) ||
-        !PatchCall(ReadParityRva, {0x0F, 0xB6, 0x4D, 0xF3, 0x83, 0xE1, 0x01}, reinterpret_cast<uintptr_t>(OnReadParity)) ||
-        !PatchCall(CaptureLeavingPlayerCallRva, {0xE8, 0x10, 0xAA, 0xEA, 0xFF},
-                   reinterpret_cast<uintptr_t>(OnCaptureLeavingPlayer)) ||
-        // These three sites must execute the native room-entry and weapon logic.
-        // Rewriting them also removes the hooks from an already loaded hotfix.
-        !PatchCall(PrepareRoomEntitiesCallRva, {0xE8, 0x2C, 0xD7, 0xEC, 0xFF},
-                   image + PrepareRoomEntitiesRva) ||
-        !PatchCall(IncubusWeaponCallRva, {0xE8, 0x17, 0x08, 0x01, 0x00},
-                   image + FamiliarWeaponUpdateRva) ||
-        !PatchCall(TwistedBabyWeaponCallRva, {0xE8, 0xA3, 0xAB, 0x00, 0x00},
-                   image + FamiliarWeaponUpdateRva) ||
-        !PatchCall(RestoreCachedPlayerCallRva, {0xE8, 0x66, 0x1B, 0xEA, 0xFF},
-                   reinterpret_cast<uintptr_t>(OnRestoreCachedPlayer)) ||
-        !PatchCall(RestoredFamiliarUpdateCallRva, {0x8B, 0xCF, 0xFF, 0x50, 0x0C},
-                   reinterpret_cast<uintptr_t>(OnRestoredFamiliarUpdate)) ||
-        !PatchCall(PreviewAddedTrinketCallRva, {0xE8, 0x18, 0x0C, 0x00, 0x00},
-                   reinterpret_cast<uintptr_t>(OnPreviewTrinketStats)) ||
-        !PatchCall(PreviewRemovedTrinketCallRva, {0xE8, 0xA4, 0x08, 0x00, 0x00},
-                   reinterpret_cast<uintptr_t>(OnPreviewTrinketStats)) ||
-        // Restore the native call, including when replacing an active v14 hotfix.
-        !PatchCall(SeedDeathmatchRoomCallRva, {0xE8, 0x2A, 0xFB, 0xFF, 0xFF},
-                   image + SeedRoomDescriptorRva) ||
-        !RestoreFamiliarInitialize()) {
+    const CallPatch patches[]{
+        RedirectCall(RoomUpdateCallRva, RoomUpdateRva, reinterpret_cast<uintptr_t>(OnRoomUpdate)),
+        RedirectCall(NetUpdateCallRva, NetUpdateRva, reinterpret_cast<uintptr_t>(OnNetUpdate)),
+        RedirectCall(StartPendingCallRva, StartPendingRva, reinterpret_cast<uintptr_t>(OnStartPending)),
+        RedirectCall(RestoreHostCallRva, RestoreJoinedGameRva, reinterpret_cast<uintptr_t>(OnRestoreHost)),
+        RedirectCall(GuestJoinPassCallRva, JoinEntityPassRva, reinterpret_cast<uintptr_t>(OnGuestJoinPass)),
+        RedirectCall(HostJoinPassCallRva, JoinEntityPassRva, reinterpret_cast<uintptr_t>(OnHostJoinPass)),
+        RedirectCall(GameUpdateCallRva, GameUpdateRva, reinterpret_cast<uintptr_t>(OnGameUpdate)),
+        RedirectCall(CaptureSnapshotCallRva, CaptureGameStateRva, reinterpret_cast<uintptr_t>(OnCaptureRoomSnapshot)),
+        {WriteParityRva, reinterpret_cast<uintptr_t>(OnWriteParity), 6, {0x88, 0x85, 0x97, 0x00, 0xFE, 0xFF}},
+        {ReadParityRva, reinterpret_cast<uintptr_t>(OnReadParity), 7, {0x0F, 0xB6, 0x4D, 0xF3, 0x83, 0xE1, 0x01}},
+        RedirectCall(CaptureLeavingPlayerCallRva, CapturePlayerStateRva, reinterpret_cast<uintptr_t>(OnCaptureLeavingPlayer)),
+        RedirectCall(RestoreCachedPlayerCallRva, RestorePlayerStateRva, reinterpret_cast<uintptr_t>(OnRestoreCachedPlayer)),
+        {RestoredFamiliarUpdateCallRva, reinterpret_cast<uintptr_t>(OnRestoredFamiliarUpdate), 5,
+            {0x8B, 0xCF, 0xFF, 0x50, 0x0C}},
+    };
+    if (!InstallCallPatches(image, patches, replaceExisting ? IsPreviousRoomRejoinCall : nullptr)) {
         logger(0, "room_rejoin_unavailable", "patch_call", 0, -1, -1);
-        return;
+        return false;
     }
     logEvent = logger;
     logEvent(0, "room_rejoin_ready", BetterCoop::RoomSnapshotMarker, 0, -1, -1);
+    return true;
 }
 
 // Used by the hotfix: patch with a silent logger while other threads are
@@ -1265,7 +1162,7 @@ void InitializeRoomRejoin(Log logger) {
     char enabled[2];
     if (GetEnvironmentVariableA("ISAAC_NETDIAG_ROOM_REJOIN", enabled, sizeof(enabled)) == 1 &&
         enabled[0] == '1') {
-        EnableRoomRejoin(logger);
+        EnableRoomRejoin(logger, false);
     }
 }
 

@@ -1,15 +1,15 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <bcrypt.h>
 #include <mmsystem.h>
 #include <shellapi.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include "game_build.h"
 
 using OnlineEvent = void (*)(uint64_t, const char*, const char*, unsigned, int, int);
-void EnableRoomRejoin(OnlineEvent logger);
+bool EnableRoomRejoin(OnlineEvent logger, bool replaceExisting);
 void EnableOnlineCheckpoint(OnlineEvent logger, bool resume);
 
 namespace {
@@ -54,47 +54,11 @@ LaunchOptions ParseLaunchOptions(int count, wchar_t* const* arguments) {
     return options;
 }
 
-bool MatchesGameImage(const wchar_t* path) {
-    // Same stock x86 build as the diagnostic launcher.
-    constexpr BYTE expected[] = {0x3b, 0xdf, 0xc8, 0xba, 0xe0, 0xdc, 0x7e, 0x33,
-        0x4b, 0x76, 0x00, 0x9d, 0x0a, 0xd4, 0x5d, 0xfb, 0xb1, 0x6e, 0xe5, 0xf0,
-        0x0c, 0x06, 0xff, 0xbc, 0x3a, 0x00, 0x94, 0xe3, 0x4d, 0x44, 0x61, 0x6b};
-    const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    LARGE_INTEGER size{};
-    HANDLE mapping = nullptr;
-    if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= 128 * 1024 * 1024) {
-        mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    }
-    CloseHandle(file);
-    if (!mapping) {
-        return false;
-    }
-    auto* bytes = static_cast<BYTE*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
-    CloseHandle(mapping);
-    if (!bytes) {
-        return false;
-    }
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BYTE digest[sizeof(expected)]{};
-    const bool hashed = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
-        BCryptHash(algorithm, nullptr, 0, bytes, static_cast<ULONG>(size.QuadPart), digest, sizeof(digest)) == 0;
-    if (algorithm) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-    }
-    UnmapViewOfFile(bytes);
-    return hashed && std::memcmp(digest, expected, sizeof(expected)) == 0;
-}
-
 using GameLog = void (__cdecl *)(int, const char*, ...);
-constexpr uintptr_t GameLogRva = 0x6112C0;
 
 // Mirror mod events into the game's own log.txt (and its desync dumps).
 void GameLogEvent(uint64_t peer, const char* event, const char* reason, unsigned frame, int from, int to) {
-    const auto log = reinterpret_cast<GameLog>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + GameLogRva);
+    const auto log = reinterpret_cast<GameLog>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + IsaacRelease::GameLogRva);
     log(1, "[BetterCoop] [Frame %u] %s: %s (from=%d to=%d peer=%llu)\n", frame, event, reason, from, to, peer);
 }
 
@@ -119,13 +83,14 @@ BOOL CALLBACK InitializeFeatures(PINIT_ONCE, PVOID, PVOID*) {
     if (!filename || _wcsicmp(filename + 1, L"isaac-ng.exe") != 0) {
         return TRUE;
     }
-    if (!MatchesGameImage(path)) {
+    const auto image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (!IsaacRelease::MatchesLoadedImage(image) || !IsaacRelease::MatchesGameFile(path)) {
         MessageBoxW(nullptr, L"This Isaac build is not supported by Room Rejoin. The game will start without the mod.",
                     L"Isaac Room Rejoin", MB_OK | MB_ICONWARNING);
         return TRUE;
     }
     if (options.roomRejoin) {
-        EnableRoomRejoin(GameLogEvent);
+        EnableRoomRejoin(GameLogEvent, false);
     }
     if (options.saveOnline || options.resumeOnline) {
         EnableOnlineCheckpoint(GameLogEvent, options.resumeOnline);

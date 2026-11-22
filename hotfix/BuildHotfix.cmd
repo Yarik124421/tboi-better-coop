@@ -17,7 +17,7 @@ if errorlevel 1 exit /b 1
 pushd "%~dp0.."
 if errorlevel 1 exit /b 1
 if not exist build\hotfix mkdir build\hotfix
-cl /nologo /std:c++17 /O2 /MT /W4 /EHsc /LD /Fo:build\hotfix\ hotfix\hotfix.cpp room_rejoin.cpp /link /OUT:build\bettercoop_hotfix_v%COOP_VERSION%.dll /IMPLIB:build\hotfix\bettercoop_hotfix_v%COOP_VERSION%.lib user32.lib
+cl /nologo /std:c++17 /O2 /MT /W4 /EHsc /LD /Fo:build\hotfix\ hotfix\hotfix.cpp room_rejoin.cpp /link /OUT:build\bettercoop_hotfix_v%COOP_VERSION%.dll /IMPLIB:build\hotfix\bettercoop_hotfix_v%COOP_VERSION%.lib user32.lib bcrypt.lib
 if errorlevel 1 goto done
 cl /nologo /std:c++17 /O2 /MT /W4 /EHsc /Fo:build\hotfix\ hotfix\inject.cpp /link /OUT:build\inject.exe
 :done

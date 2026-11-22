@@ -2,7 +2,7 @@
 
 // Internal build and room-rejoin compatibility revision. Change it here only.
 // GitHub release tags (for example v0.2.1) are managed separately.
-#define BETTERCOOP_VERSION 19
+#define BETTERCOOP_VERSION 23
 
 #define BETTERCOOP_STRINGIFY_IMPL(value) #value
 #define BETTERCOOP_STRINGIFY(value) BETTERCOOP_STRINGIFY_IMPL(value)
